@@ -251,30 +251,21 @@ def format_summary(
     record_type: str = "",
     venue: str = "",
 ) -> str:
-    """Turn a source extract into a longer, instructional research note.
+    """Turn a source extract into a longer, standalone educational summary.
 
-    The source text remains the evidence. The added sections teach the reader
-    how to interpret and use that evidence without inventing results that were
-    not present in the abstract or article lead.
+    Every section is built from the source text itself so the reader learns
+    the actual substance of the finding here, without needing to open the
+    original article. Nothing is invented beyond what the abstract states.
     """
     text = re.sub(r"\s+", " ", html.unescape(value or "")).strip()
     label = record_type or "source"
     source_label = source or venue or "the source"
     title_label = title or "this finding"
     if not text:
-        return "\n\n".join(
-            [
-                "### Plain-language explanation\n\n"
-                f"This {label} is titled **{title_label}**, but {source_label} did not provide enough "
-                "abstract text to explain its claim in detail.",
-                "### What this teaches\n\n"
-                "The missing abstract is itself important: the title can suggest a topic, but it "
-                "cannot establish what was studied, how it was studied, or what was found.",
-                "### How to use it\n\n"
-                "Open the original source before treating this as evidence. Look first for the "
-                "research question, the population or material examined, the method, the result, "
-                "and the limitations.",
-            ]
+        return (
+            "### Plain-language explanation\n\n"
+            f"This {label} is titled **{title_label}**, but {source_label} did not provide enough "
+            "abstract text to summarize its content here."
         )
 
     sentences = [
@@ -288,28 +279,8 @@ def format_summary(
     extended_detail = " ".join(sentences[48:])
     if not supporting:
         supporting = (
-            "The available extract is brief, so it should be read as an orientation rather than "
-            "a complete account of the evidence. The full source may contain details about the "
-            "sample, method, measures, results, and limitations that are not visible here."
-        )
-
-    if source.lower() == "wikipedia":
-        source_guidance = (
-            "Use this as a readable map of the topic and its vocabulary. Wikipedia is useful for "
-            "orientation and references, but it is not a substitute for the primary studies linked "
-            "in the article."
-        )
-    elif source.lower() == "arxiv":
-        source_guidance = (
-            "Treat this as a research preprint unless the linked record confirms peer review. "
-            "Read the methods and evaluation details before using the claim in teaching, policy, "
-            "or a high-stakes decision."
-        )
-    else:
-        source_guidance = (
-            f"This record was surfaced through {source_label}. The abstract is a compressed "
-            "window into the work, so use the linked publication to verify the full method, "
-            "population, measurements, results, and limitations."
+            "The available extract is brief, covering little beyond the plain-language explanation "
+            "above."
         )
 
     return "\n\n".join(
@@ -317,8 +288,7 @@ def format_summary(
             "### Plain-language explanation\n\n"
             f"This {label} is about **{title_label}**. In everyday terms, {core}",
             "### What this teaches\n\n"
-            f"{supporting} Together, these details help distinguish the topic itself from the "
-            "specific claim or explanation offered by this source.",
+            f"{supporting}",
             *(
                 [
                     "### Further detail from the source\n\n"
@@ -335,15 +305,6 @@ def format_summary(
                 if extended_detail
                 else []
             ),
-            "### How to use this evidence\n\n"
-            f"{source_guidance} A useful reading sequence is: identify the question, note who or "
-            "what was examined, trace how the conclusion was supported, and then check whether "
-            "the limits of the work match the strength of the language used.",
-            "### Questions worth asking\n\n"
-            "- What question is the source actually answering, and what question is it not answering?\n"
-            "- Who or what does the evidence describe, and can that context be generalized?\n"
-            "- Which method, comparison, or observation supports the main conclusion?\n"
-            "- What uncertainty, missing context, or limitation should change how confidently I use it?",
         ]
     )
 
@@ -373,7 +334,18 @@ def topic_keywords(topic: str) -> set[str]:
 
 
 def matching_topics(record: SourceRecord, topics: Sequence[str]) -> list[str]:
-    """Attach a crawled article to every standing subject it genuinely fits."""
+    """Attach a crawled article to every standing subject it genuinely fits.
+
+    Stopword-stripping in topic_keywords() collapses phrases like "adult
+    learning" or "computer science" down to a single generic leftover word
+    ("adult", "computer"). A lone hit on a word that common is not evidence
+    of relevance -- it just means some unrelated article happened to use
+    that word once. So a single-keyword topic now requires the topic's
+    actual wording to appear together (a phrase hit), not just one of its
+    remaining words in isolation. Multi-keyword topics can still match on
+    keyword overlap, since two or more distinct topic words showing up
+    together is a much stronger signal.
+    """
     searchable_title = normalize_title(record.title)
     searchable_body = normalize_title(
         " ".join((record.abstract, record.venue, *record.tags))
@@ -383,12 +355,18 @@ def matching_topics(record: SourceRecord, topics: Sequence[str]) -> list[str]:
         keywords = topic_keywords(topic)
         if not keywords:
             continue
+        topic_phrase = normalize_title(topic)
+        phrase_hit = bool(topic_phrase) and (
+            topic_phrase in searchable_title or topic_phrase in searchable_body
+        )
         title_hits = sum(int(keyword in searchable_title) for keyword in keywords)
         body_hits = sum(int(keyword in searchable_body) for keyword in keywords)
-        # A title hit is strong evidence; otherwise require two body/category
-        # signals so the crawl does not classify every page as "education".
-        if title_hits >= 1 or body_hits >= min(2, len(keywords)):
+        if phrase_hit:
             matches.append(topic)
+        elif len(keywords) >= 2 and (title_hits >= 2 or body_hits >= len(keywords)):
+            matches.append(topic)
+        # Topics that reduce to a single leftover keyword never match on
+        # that one word alone anymore -- they need the full phrase hit above.
     return matches
 
 
@@ -1351,6 +1329,16 @@ class ResponseCache:
 class PublicResearchAPI:
     """HTTP helpers and source-specific adapters for public scholarly data."""
 
+    # The Wikipedia harvest runs seven partition crawlers in parallel, all
+    # sharing one PublicResearchAPI instance. With no shared pacing between
+    # them, they burst dozens of concurrent requests at Wikipedia's search
+    # API and quickly trip its anonymous rate limit (repeated "HTTP Error
+    # 429: Too Many Requests"). This enforces a minimum gap between
+    # consecutive requests to the same host, across all threads.
+    MIN_REQUEST_INTERVAL = {
+        "en.wikipedia.org": 0.5,
+    }
+
     def __init__(
         self,
         timeout: int = 18,
@@ -1360,6 +1348,21 @@ class PublicResearchAPI:
         self.timeout = timeout
         self.max_results = max_results
         self.cache = cache
+        self._host_lock = threading.Lock()
+        self._host_last_request: dict[str, float] = {}
+
+    def _throttle(self, url: str) -> None:
+        host = urllib.parse.urlparse(url).netloc
+        interval = self.MIN_REQUEST_INTERVAL.get(host)
+        if not interval:
+            return
+        with self._host_lock:
+            now = time.monotonic()
+            last = self._host_last_request.get(host, 0.0)
+            wait = interval - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+            self._host_last_request[host] = time.monotonic()
 
     @staticmethod
     def _cache_ttl(url: str) -> int:
@@ -1376,13 +1379,25 @@ class PublicResearchAPI:
             return CACHE_TTL_SECONDS["Wikipedia"]
         return DEFAULT_CACHE_TTL_SECONDS
 
+    @staticmethod
+    def _retry_after_seconds(exc: urllib.error.HTTPError, attempt: int) -> float:
+        header = exc.headers.get("Retry-After") if exc.headers else None
+        if header:
+            try:
+                return max(float(header), 1.0)
+            except ValueError:
+                pass
+        return float(2**attempt)
+
     def fetch_json(self, url: str) -> dict[str, Any]:
         ttl = self._cache_ttl(url)
         if self.cache is not None:
             cached = self.cache.get(url, ttl)
             if cached is not None:
                 return json.loads(cached)
-        for attempt in range(4):
+        attempts = 6
+        for attempt in range(attempts):
+            self._throttle(url)
             request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -1391,11 +1406,12 @@ class PublicResearchAPI:
                     self.cache.set(url, body)
                 return json.loads(body)
             except urllib.error.HTTPError as exc:
-                if exc.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                if exc.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
                     raise
-                time.sleep(2**attempt)
+                time.sleep(self._retry_after_seconds(exc, attempt))
 
     def fetch_text(self, url: str) -> str:
+        self._throttle(url)
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml,text/xml"})
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             return response.read().decode("utf-8")
@@ -1589,11 +1605,21 @@ class PublicResearchAPI:
         continuation = (page_data.get("continue") or {}).get("gapcontinue", "")
         return records, continuation, len(pages)
 
+    # Crossref registers a DOI for every individual figure, table, and
+    # sub-part of a report -- not just for the report itself. Those
+    # "component" (and similarly non-substantive) records have a caption for
+    # a title and never carry an abstract, so they were flooding topic
+    # folders with a wall of identical "no abstract available" placeholder
+    # files. They are not standalone findings, so skip them at the source.
+    CROSSREF_EXCLUDED_TYPES = {"component", "grant", "peer-review"}
+
     def crossref(self, query: str) -> list[SourceRecord]:
         params = urllib.parse.urlencode({"query.bibliographic": query, "rows": self.max_results, "select": "title,author,published,container-title,URL,DOI,type,abstract"})
         data = self.fetch_json(f"https://api.crossref.org/works?{params}")
         records: list[SourceRecord] = []
         for item in data.get("message", {}).get("items", []):
+            if (item.get("type") or "") in self.CROSSREF_EXCLUDED_TYPES:
+                continue
             title = compact((item.get("title") or [""])[0], 240)
             if not title:
                 continue
@@ -1883,7 +1909,7 @@ class ResearchCoordinator:
             "mode": "autonomous_wikipedia_harvest",
             "teams": [dataclasses.asdict(team) for team in TEAMS],
             "sources_attempted": ["Wikipedia"],
-            "entries_written": len(records),
+            "entries_written": sum(1 for record in records if record.abstract.strip()),
             "corpus_entries_for_topic": corpus.count(self.topic),
             "corpus_entries_total": corpus.count(),
             "wikipedia_batch_size": wikipedia_batch,
@@ -1904,7 +1930,7 @@ class ResearchCoordinator:
             "mode": "autonomous_corpus_entries",
             "teams": [dataclasses.asdict(team) for team in TEAMS],
             "sources_attempted": ["Wikipedia"],
-            "entries_written": len(records),
+            "entries_written": sum(1 for record in records if record.abstract.strip()),
             "corpus_entries_for_topic": corpus.count(self.topic),
             "corpus_entries_total": corpus.count(),
         }
@@ -2013,7 +2039,11 @@ class ResearchCoordinator:
                 by_key[key] = scored
         return sorted(by_key.values(), key=lambda record: (-record.score, record.year, record.title))
 
-    def write_discovery(self, records: Sequence[SourceRecord], metadata: dict[str, Any]) -> Path:
+    def write_discovery(self, records: Sequence[SourceRecord], metadata: dict[str, Any]) -> Path | None:
+        if not records:
+            # Nothing genuinely matched this topic yet -- don't leave behind
+            # an empty folder with just a discovery.json in it.
+            return None
         folder = self.output / slugify(self.topic)
         folder.mkdir(parents=True, exist_ok=True)
         payload = {"metadata": metadata, "entries": [record.as_dict() for record in records]}
@@ -2023,7 +2053,15 @@ class ResearchCoordinator:
         return path
 
     def write_entry_files(self, records: Sequence[SourceRecord], metadata: dict[str, Any]) -> list[Path]:
-        """Write one standalone Markdown summary for every research finding."""
+        """Write one standalone Markdown summary for every research finding.
+
+        A record with no abstract has nothing for format_summary() to teach
+        from beyond a placeholder ("did not provide enough abstract text..."),
+        so those records are skipped here rather than turned into a file.
+        """
+        records = [record for record in records if record.abstract.strip()]
+        if not records:
+            return []
         folder = self.output / slugify(self.topic)
         folder.mkdir(parents=True, exist_ok=True)
         legacy_book = folder / "quick_book.md"
@@ -2136,8 +2174,11 @@ class ResearchCoordinator:
         entries = self.write_entry_files(records, metadata)
         index = self.write_index() if update_index else None
         self.console.section("Library update")
-        self.console.success(f"individual findings  {len(entries)} files in {self.output / slugify(self.topic)}")
-        self.console.success(f"raw records {discovery}")
+        if entries:
+            self.console.success(f"individual findings  {len(entries)} files in {self.output / slugify(self.topic)}")
+            self.console.success(f"raw records {discovery}")
+        else:
+            self.console.warn(f"no genuine matches for '{self.topic}' this run — nothing written")
         if index:
             self.console.success(f"index       {index}")
 
