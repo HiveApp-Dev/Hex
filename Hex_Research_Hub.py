@@ -79,6 +79,10 @@ DEFAULT_INTERVAL_HOURS = 6.0
 DEFAULT_TOPIC_CONCURRENCY = 4
 DEFAULT_WIKIPEDIA_BATCH = 500
 WIKIPEDIA_ARTICLE_CHARS = 32000
+# Below this, a harvested page is effectively a stub -- a short definition,
+# a disambiguation-like page, or an acronym entry -- and isn't substantial
+# enough to teach a topic on its own, even if a keyword happens to line up.
+MIN_HARVEST_ABSTRACT_CHARS = 400
 # Scholarly APIs often return useful methods, populations, and caveats after
 # the first sentence. Keep enough of each abstract for the written finding to
 # teach instead of reducing it to a headline.
@@ -333,7 +337,7 @@ def topic_keywords(topic: str) -> set[str]:
     }
 
 
-def matching_topics(record: SourceRecord, topics: Sequence[str]) -> list[str]:
+def matching_topics(record: SourceRecord, topics: Sequence[str], strict: bool = False) -> list[str]:
     """Attach a crawled article to every standing subject it genuinely fits.
 
     Stopword-stripping in topic_keywords() collapses phrases like "adult
@@ -345,6 +349,15 @@ def matching_topics(record: SourceRecord, topics: Sequence[str]) -> list[str]:
     remaining words in isolation. Multi-keyword topics can still match on
     keyword overlap, since two or more distinct topic words showing up
     together is a much stronger signal.
+
+    strict=True drops the keyword-overlap fallback entirely and requires the
+    topic's actual phrase to appear. Use this for untargeted sources -- e.g.
+    the full-Wikipedia alphabetical harvest, which walks every article with
+    no relevance to any topic to begin with, rather than a search actually
+    aimed at the topic. Keyword overlap is a reasonable corroborating signal
+    when the source was already retrieved *because* it plausibly relates to
+    the topic; it is not enough evidence on its own to justify tagging a
+    random, untargeted page.
     """
     searchable_title = normalize_title(record.title)
     searchable_body = normalize_title(
@@ -363,7 +376,7 @@ def matching_topics(record: SourceRecord, topics: Sequence[str]) -> list[str]:
         body_hits = sum(int(keyword in searchable_body) for keyword in keywords)
         if phrase_hit:
             matches.append(topic)
-        elif len(keywords) >= 2 and (title_hits >= 2 or body_hits >= len(keywords)):
+        elif not strict and len(keywords) >= 2 and (title_hits >= 2 or body_hits >= len(keywords)):
             matches.append(topic)
         # Topics that reduce to a single leftover keyword never match on
         # that one word alone anymore -- they need the full phrase hit above.
@@ -1379,15 +1392,23 @@ class PublicResearchAPI:
             return CACHE_TTL_SECONDS["Wikipedia"]
         return DEFAULT_CACHE_TTL_SECONDS
 
+    # Wikimedia's Retry-After on a 429 can legitimately ask for a long wait
+    # (well beyond a couple seconds) once its rate limiter has been tripped.
+    # Honoring that literally across several attempts made single requests
+    # block for minutes. Partitions already checkpoint their progress and
+    # get retried automatically on the next cycle, so there's no need to sit
+    # and wait it out synchronously here -- cap the wait and fail fast.
+    MAX_RETRY_WAIT_SECONDS = 12.0
+
     @staticmethod
     def _retry_after_seconds(exc: urllib.error.HTTPError, attempt: int) -> float:
         header = exc.headers.get("Retry-After") if exc.headers else None
         if header:
             try:
-                return max(float(header), 1.0)
+                return min(max(float(header), 1.0), PublicResearchAPI.MAX_RETRY_WAIT_SECONDS)
             except ValueError:
                 pass
-        return float(2**attempt)
+        return min(float(2**attempt), PublicResearchAPI.MAX_RETRY_WAIT_SECONDS)
 
     def fetch_json(self, url: str) -> dict[str, Any]:
         ttl = self._cache_ttl(url)
@@ -1395,7 +1416,7 @@ class PublicResearchAPI:
             cached = self.cache.get(url, ttl)
             if cached is not None:
                 return json.loads(cached)
-        attempts = 6
+        attempts = 4
         for attempt in range(attempts):
             self._throttle(url)
             request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
@@ -1839,14 +1860,22 @@ class ResearchCoordinator:
         tagged = [dataclasses.replace(record, tags=unique((*record.tags, team.key)) ) for record in records]
         inserted = corpus.upsert(tagged, cursor_topic)
         assigned = 0
+        # The harvest walks Wikipedia alphabetically with no relevance to any
+        # topic, so a stub-length page ("D&E", "T&C", ...) rarely has enough
+        # substance to teach anything even when a keyword happens to line up.
+        # Require a minimum amount of real article text before it's even
+        # considered as a candidate for a topic folder.
+        candidates = [record for record in records if len(record.abstract) >= MIN_HARVEST_ABSTRACT_CHARS]
         for topic in unique(catalog_topics or [self.topic]):
             relevant = [
                 dataclasses.replace(
                     record,
                     tags=unique((*record.tags, topic, *topic_keywords(topic))),
                 )
-                for record in records
-                if topic in matching_topics(record, [topic])
+                for record in candidates
+                # strict=True: no keyword-overlap fallback for an untargeted
+                # crawl -- see matching_topics() for why.
+                if topic in matching_topics(record, [topic], strict=True)
             ]
             if relevant:
                 corpus.upsert(relevant, topic)
